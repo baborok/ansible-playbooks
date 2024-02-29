@@ -1,0 +1,140 @@
+---
+- hosts: localhost
+  become: yes
+  tasks:
+    - name: Update apt package cache
+      apt:
+        update_cache: yes
+
+    - name: Install OpenJDK 11
+      apt:
+        name: openjdk-11-jdk
+        state: present
+
+    - name: Download Kafka
+      get_url:
+        url: "https://downloads.apache.org/kafka/3.5.0/kafka_2.12-3.5.0.tgz"
+        dest: "/tmp/kafka_2.12-3.5.0.tgz"
+
+    - name: Extract Kafka archive
+      ansible.builtin.unarchive:
+        src: "/tmp/kafka_2.12-3.5.0.tgz"
+        dest: "/opt/"
+        remote_src: yes
+
+    - name: Rename Kafka directory
+      command: mv /opt/kafka_2.12-3.5.0 /opt/kafka
+
+    - name: Configure Zookeeper service
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Apache Zookeeper service
+          Documentation=http://zookeeper.apache.org
+          Requires=network.target remote-fs.target
+          After=network.target remote-fs.target
+
+          [Service]
+          Type=simple
+          ExecStart=/opt/kafka/bin/zookeeper-server-start.sh /opt/kafka/config/zookeeper.properties
+          ExecStop=/opt/kafka/bin/zookeeper-server-stop.sh
+          Restart=on-abnormal
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/zookeeper.service
+      notify:
+
+    - name: Configure Kafka service
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Apache Kafka Service
+          Documentation=http://kafka.apache.org/documentation.html
+          Requires=zookeeper.service
+
+          [Service]
+          Type=simple
+          Environment="JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64"
+          ExecStart=/opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/server.properties
+          ExecStop=/opt/kafka/bin/kafka-server-stop.sh
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/kafka.service
+      notify:
+
+    - name: Manage Zookeeper service
+      ansible.builtin.systemd_service:
+        name: zookeeper
+        state: started
+        enabled: yes
+
+    - name: Manage Kafka service
+      ansible.builtin.systemd_service:
+        name: kafka
+        state: started
+        enabled: yes
+
+    - name: Create Kafka topic
+      command: "/opt/kafka/bin/kafka-topics.sh --create --bootstrap-server localhost:9092 --replication-factor 1 --partitions 1 --topic filebeat"
+      args:
+        chdir: "/opt/kafka/bin/"
+
+- hosts: localhost
+  become: true
+  serial: 1
+  vars:
+    node_exporter_version: 1.7.0
+
+  tasks:
+    - name: create system user
+      user:
+        name: prometheus
+        state: present
+        system: true
+        createhome: false
+
+    - name: download node exporter
+      get_url:
+        url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+        dest: /tmp
+
+    - name: unarchive node exporter
+      unarchive:
+        remote_src: yes
+        src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+        dest: /tmp
+
+    - name: move node exporter to /usr/local/bin
+      copy:
+        src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+        dest: /usr/local/bin/node_exporter
+        remote_src: yes
+        owner: prometheus
+        group: prometheus
+        mode: 0755
+
+    - name: copy systemd configuration to file
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/node_exporter.service
+        content: |
+          [Unit]
+          Description=Node Exporter
+          After=network.target
+          
+          [Service]
+          User=prometheus
+          Group=prometheus
+          Type=simple
+          ExecStart=/usr/local/bin/node_exporter --collector.systemd --collector.systemd.unit-include=(sshd|httpd).service
+          
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: configure systemd to use service
+      systemd:
+        daemon_reload: yes
+        enabled: yes
+        state: started
+        name: node_exporter.service
