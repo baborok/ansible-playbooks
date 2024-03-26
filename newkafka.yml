@@ -1,0 +1,144 @@
+---
+- hosts: localhost
+  become: yes
+  tasks:
+    - name: Update apt package cache
+      apt:
+        update_cache: yes
+
+    - name: Install OpenJDK 11
+      apt:
+        name: openjdk-11-jdk
+        state: present
+
+    - name: Download Kafka Binary Distribution
+      get_url:
+        url: "https://archive.apache.org/dist/kafka/3.5.0/kafka_2.13-3.5.0.tgz"
+        dest: "/tmp/kafka_2.13-3.5.0.tgz"
+
+    - name: Extract Kafka archive
+      ansible.builtin.unarchive:
+        src: "/tmp/kafka_2.13-3.5.0.tgz"
+        dest: "/opt/"
+        remote_src: yes
+        creates: "/opt/kafka"
+
+    - name: Rename Kafka directory
+      command: mv /opt/kafka_2.13-3.5.0 /opt/kafka
+      args:
+        creates: "/opt/kafka"
+
+    - name: Configure Zookeeper service
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Apache Zookeeper service
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart=/opt/kafka/bin/zookeeper-server-start.sh /opt/kafka/config/zookeeper.properties
+          ExecStop=/opt/kafka/bin/zookeeper-server-stop.sh
+          Restart=on-abnormal
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/zookeeper.service
+
+    - name: Configure Kafka service
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Apache Kafka Service
+          After=zookeeper.service
+
+          [Service]
+          Type=simple
+          Environment="JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64"
+          ExecStart=/opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/server.properties
+          ExecStop=/opt/kafka/bin/kafka-server-stop.sh
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/kafka.service
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: Start and enable Zookeeper service
+      ansible.builtin.systemd:
+        name: zookeeper
+        state: started
+        enabled: yes
+
+    - name: Start and enable Kafka service
+      ansible.builtin.systemd:
+        name: kafka
+        state: started
+        enabled: yes
+
+    - name: Create Kafka topic
+      command: /opt/kafka/bin/kafka-topics.sh --create --bootstrap-server localhost:9092 --replication-factor 1 --partitions 1 --topic filebeat
+      args:
+        chdir: /opt/kafka/bin/
+
+- hosts: localhost
+  become: true
+  serial: 1
+  vars:
+    node_exporter_version: "1.7.0"
+
+  tasks:
+    - name: Create system user for Prometheus
+      user:
+        name: prometheus
+        state: present
+        system: true
+        createhome: false
+
+    - name: Download Node Exporter
+      get_url:
+        url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+        dest: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+
+    - name: Unarchive Node Exporter
+      ansible.builtin.unarchive:
+        src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+        dest: "/tmp/"
+        remote_src: yes
+
+    - name: Move Node Exporter binary to /usr/local/bin
+      command: mv /tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter /usr/local/bin/
+      args:
+        creates: /usr/local/bin/node_exporter
+
+    - name: Ensure correct ownership of Node Exporter binary
+      file:
+        path: /usr/local/bin/node_exporter
+        owner: prometheus
+        group: prometheus
+        mode: 0755
+
+    - name: Configure Node Exporter service
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Node Exporter
+          After=network.target
+
+          [Service]
+          User=prometheus
+          Group=prometheus
+          Type=simple
+          ExecStart=/usr/local/bin/node_exporter --collector.systemd --collector.systemd.unit-include="(sshd|httpd).service"
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/node_exporter.service
+
+    - name: Start and enable Node Exporter service
+      ansible.builtin.systemd:
+        name: node_exporter
+        state: started
+        enabled: yes
